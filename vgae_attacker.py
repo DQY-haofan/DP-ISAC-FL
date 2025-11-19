@@ -1,6 +1,6 @@
 # 文件名: vgae_attacker.py
 # 作用: 核心攻击逻辑。包含 VGAE 模型和基于梯度的恶意样本生成 (Input Optimization)。
-# 版本: Final (Fix NaN using Cosine Similarity)
+# 版本: Final (Fix NaN using Cosine Similarity & Enhanced Stability)
 
 import torch
 import torch.nn as nn
@@ -45,6 +45,7 @@ class VGAE(nn.Module):
 
     def reparameterize(self, mu, logvar):
         if self.training:
+            # [Stability Fix] Limit logvar to prevent explosion
             logvar = torch.clamp(logvar, max=10.0)
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
@@ -60,6 +61,7 @@ class VGAE(nn.Module):
 def inner_product_decoder(z):
     adj_logits = torch.matmul(z, z.t())
     probs = torch.sigmoid(adj_logits)
+    # [Stability Fix] Clamp probabilities to avoid log(0) in BCE Loss
     probs = torch.clamp(probs, min=1e-7, max=1.0 - 1e-7)
     return probs, adj_logits
 
@@ -113,6 +115,7 @@ class VGAEAttacker:
         self._build_graph(self.f_polluted)
 
     def _build_graph(self, features):
+        # [Stability Fix] Add epsilon to norm
         features_norm = F.normalize(features, p=2, dim=1, eps=1e-8)
         sim_matrix = torch.mm(features_norm, features_norm.t())
 
@@ -122,6 +125,7 @@ class VGAEAttacker:
 
         adj_tilde = adj + torch.eye(adj.shape[0]).to(self.device)
         degree = torch.sum(adj_tilde, dim=1)
+        # [Stability Fix] Avoid division by zero for isolated nodes
         d_inv_sqrt = torch.pow(degree + 1e-8, -0.5)
         d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
         d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
@@ -136,6 +140,7 @@ class VGAEAttacker:
         for epoch in range(self.conf['vgae_epochs']):
             self.optimizer.zero_grad()
 
+            # [Stability Fix] Check for NaN input
             if torch.isnan(self.f_polluted).any():
                 print(f"⚠️ [VGAE] NaN Input, Skip Round {round_idx}")
                 return
@@ -144,7 +149,10 @@ class VGAEAttacker:
             rec_adj, _ = inner_product_decoder(z)
 
             loss_rec = F.binary_cross_entropy(rec_adj, self.adj_label.detach())
-            loss_kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
+
+            # [Stability Fix] Clamp logvar in KL calculation just in case
+            logvar_clamped = torch.clamp(logvar, max=10.0)
+            loss_kl = -0.5 * torch.mean(torch.sum(1 + logvar_clamped - mu.pow(2) - logvar_clamped.exp(), dim=1))
 
             loss = loss_rec + loss_kl
 
@@ -153,6 +161,7 @@ class VGAEAttacker:
                 break
 
             loss.backward()
+            # [Stability Fix] Clip gradients
             torch.nn.utils.clip_grad_norm_(self.vgae.parameters(), max_norm=1.0)
             self.optimizer.step()
 
@@ -174,9 +183,6 @@ class VGAEAttacker:
 
         # 确定攻击方向: 反向于良性更新的平均方向
         attack_direction = -torch.sign(mean_benign_vec).detach()
-        # 归一化攻击方向，确保计算 Cosine 时数值稳定
-        # attack_direction = F.normalize(attack_direction, p=2, dim=0)
-        # 上面这行不需要，因为 cosine_similarity 会自动处理归一化
 
         # 初始化恶意输入 w_mal
         w_mal = mean_benign_vec.clone().detach().unsqueeze(0)
@@ -198,10 +204,7 @@ class VGAEAttacker:
             loss_latent = F.mse_loss(z_mu_approx, z_target)
 
             # Loss 2: 破坏性 (改为余弦相似度!)
-            # 我们希望 w_mal 与 attack_direction 的相似度越大越好
-            # Cosine Sim 范围 [-1, 1].
-            # 我们最小化负的相似度 -> -1 (完全同向)
-            # 注意：unsqueeze 确保维度匹配 [1, d] vs [1, d]
+            # Cosine Sim 范围 [-1, 1]. 最小化负相似度 -> 趋向 1 (同向)
             cos_sim = F.cosine_similarity(w_mal, attack_direction.unsqueeze(0))
             loss_attack = -cos_sim.mean()
 
