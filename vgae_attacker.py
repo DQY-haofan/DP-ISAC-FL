@@ -27,7 +27,9 @@ class VGAE(nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim):
         super(VGAE, self).__init__()
         # [关键修复] 添加 LayerNorm 以处理幅度巨大的梯度输入 (G^2 ~ 20000)
+        # 这能将输入拉回 [-1, 1] 范围，防止第一层就爆炸
         self.norm = nn.LayerNorm(input_dim)
+
         self.gc1 = GraphConv(input_dim, hidden_dim)
         self.gc_mu = GraphConv(hidden_dim, latent_dim)
         self.gc_logvar = GraphConv(hidden_dim, latent_dim)
@@ -35,6 +37,7 @@ class VGAE(nn.Module):
     def encode(self, x, adj):
         # [关键修复] 先归一化，再进网络
         x = self.norm(x)
+
         hidden = F.relu(self.gc1(x, adj))
         return self.gc_mu(hidden, adj), self.gc_logvar(hidden, adj)
 
@@ -105,9 +108,9 @@ class VGAEAttacker:
         polluted_updates = flat_updates + noise
         self.f_polluted = polluted_updates[obs_indices]
 
-        # [诊断] 检查是否存在 Inf
+        # [诊断] 检查是否存在 Inf，如果有则截断
         if torch.isinf(self.f_polluted).any():
-            print("⚠️ [VGAE] Input contains Inf! Clamping...")
+            # print("⚠️ [VGAE] Input contains Inf! Clamping...")
             self.f_polluted = torch.clamp(self.f_polluted, min=-1e4, max=1e4)
 
         self._build_graph(self.f_polluted)
@@ -137,14 +140,14 @@ class VGAEAttacker:
             self.optimizer.zero_grad()
 
             if torch.isnan(self.f_polluted).any():
-                print(f"⚠️ [VGAE] Input NaN at Round {round_idx}")
+                # print(f"⚠️ [VGAE] Input NaN at Round {round_idx}")
                 return
 
             # Forward pass (Internal LayerNorm will handle scaling)
             z, mu, logvar = self.vgae(self.f_polluted.detach(), self.adj_norm.detach())
 
             if torch.isnan(z).any():
-                print(f"⚠️ [VGAE] Latent Z is NaN at Round {round_idx}")
+                # print(f"⚠️ [VGAE] Latent Z is NaN at Round {round_idx}")
                 break
 
             rec_adj, _ = inner_product_decoder(z)
@@ -155,7 +158,7 @@ class VGAEAttacker:
             loss = loss_rec + loss_kl
 
             if torch.isnan(loss):
-                print(f"⚠️ [VGAE] Loss NaN")
+                # print(f"⚠️ [VGAE] Loss NaN")
                 break
 
             loss.backward()
@@ -170,18 +173,20 @@ class VGAEAttacker:
         for p in self.vgae.parameters(): p.requires_grad = False
 
         with torch.no_grad():
+            # 使用 encode 方法确保经过 LayerNorm
             _, mu_benign, _ = self.vgae(self.f_polluted, self.adj_norm)
             z_target = torch.mean(mu_benign, dim=0, keepdim=True)
             mean_benign_vec = torch.mean(self.f_polluted, dim=0)
 
         # 如果 VGAE 已经损坏 (mu_benign 是 NaN)，回退
-        if torch.isnan(mu_benign).any():
+        if torch.isnan(z_target).any():
             return self._generate_random_update(benign_update_template)
 
         attack_direction = -torch.sign(mean_benign_vec).detach()
         w_mal = mean_benign_vec.clone().detach().unsqueeze(0)
         w_mal.requires_grad_(True)
 
+        # 降低学习率
         input_optimizer = optim.Adam([w_mal], lr=0.01)
         lambda_reg = self.conf['lambda_attack']
 
@@ -189,21 +194,11 @@ class VGAEAttacker:
             input_optimizer.zero_grad()
             if torch.isnan(w_mal).any(): break
 
-            # 注意：生成时也要经过同样的 LayerNorm 逻辑
-            # 我们通过调用 vgae.encode 来利用里面定义的 LayerNorm
-            # 但这里我们手动模拟前向过程以保持梯度图清晰
-            # 或者是直接调用 self.vgae.encode (推荐)
-
-            # 修正：使用模型的 encode 方法以确保包含 LayerNorm
-            # 为了传入 adjacency，我们假设 w_mal 是一个孤立节点或平均节点
-            # 简化：只通过 LayerNorm + GC1(linear) + ReLU + GC_MU(linear)
-
+            # 手动模拟前向传播以包含 LayerNorm
             # 1. LayerNorm
             w_norm = self.vgae.norm(w_mal)
-
-            # 2. GC1 Linear (Approximate GCN as MLP)
+            # 2. GC1 Linear
             h1 = F.relu(self.vgae.gc1.linear(w_norm))
-
             # 3. GC_MU Linear
             z_mu_approx = self.vgae.gc_mu.linear(h1)
 
