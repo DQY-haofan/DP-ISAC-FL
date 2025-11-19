@@ -1,0 +1,58 @@
+# CP-04 实验配置 (Final Version)
+experiment_name: "r_jora_final"
+seed: 42
+device: "cuda" # 会被 runner.py 自动覆盖
+
+# 数据与模型
+dataset: "mnist"
+model: "mlp"
+data_root: "./data"
+
+# 联邦学习
+num_clients: 100
+num_rounds: 50
+client_fraction: 0.1
+local_epochs: 5
+batch_size: 64
+lr: 0.01
+
+# Non-IID
+distribution: "dirichlet"
+alpha: 0.3
+
+# 初始 DP 参数 (会被 Optimal-DP 更新)
+clip_threshold: 4.0
+dp_sigma_z: 0.01
+
+# ISAC 信道
+isac_sigma_ch: 0.005
+
+# 攻击设置 (VGAE-MP)
+attack:
+  malicious_fraction: 0.2
+  # 下面的 lambda 建议先运行 tune_attacker.py 获取甜点值
+  lambda_attack: 3.0
+  tau_sim: 0.5
+  t_vgae: 10
+  q_eaves: 0.8
+  eaves_sigma: 0.005
+  vgae_epochs: 5
+  vgae_lr: 0.01
+  latent_dim: 16
+
+# R-JORA 防御配置
+r_jora:
+  enabled: true
+  enable_stga: true
+  enable_optimal_dp: true
+  enable_secure_isac: true
+  stga_alpha: 0.5
+  t_outer: 10
+  dp_search_min: 0.001
+  dp_search_max: 10.0
+  # 下面的常数建议先运行 calibration.py 获取
+  const_c_dp: 0.1
+  const_c_attack: 0.5
+  t_middle: 1
+  num_beams: 10
+  visible_beams: 2
