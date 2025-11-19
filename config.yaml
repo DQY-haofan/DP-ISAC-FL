@@ -14,14 +14,14 @@ num_rounds: 50
 client_fraction: 0.1
 local_epochs: 5
 batch_size: 64
-lr: 0.01
+lr: 0.005
 
 # Non-IID
 distribution: "dirichlet"
 alpha: 0.3
 
 # 初始 DP 参数 (会被 Optimal-DP 更新)
-clip_threshold: 4.0
+clip_threshold: 15.0
 dp_sigma_z: 0.01
 
 # ISAC 信道
