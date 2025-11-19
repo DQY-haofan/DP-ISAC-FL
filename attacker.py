@@ -31,9 +31,8 @@ class VGAE(nn.Module):
 
     def reparameterize(self, mu, logvar):
         if self.training:
-            # [修复] 限制 logvar 的范围，防止指数爆炸导致 NaN
-            # logvar > 10 意味着方差非常大，通常是不合理的
-            logvar = torch.clamp(logvar, max=10)
+            # [稳定性修复] 限制 logvar 范围，防止指数爆炸
+            logvar = torch.clamp(logvar, max=10.0)
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             return mu + eps * std
@@ -47,8 +46,6 @@ class VGAE(nn.Module):
 
 def inner_product_decoder(z):
     adj_logits = torch.matmul(z, z.t())
-    # [修复] Sigmoid 输出理论上在 (0, 1)，但在 float32 下可能溢出为 0 或 1
-    # 这会导致 BCE Loss 计算 log(0) 而崩溃
     return torch.sigmoid(adj_logits), adj_logits
 
 
@@ -91,7 +88,6 @@ class VGAEAttacker:
             num_obs = int(num_updates * self.conf['q_eaves'])
             obs_indices = torch.randperm(num_updates)[:num_obs].to(self.device)
 
-        # [安全检查] 确保有观测到的客户端，否则跳过
         if len(obs_indices) == 0:
             self.f_polluted = None
             return
@@ -106,7 +102,7 @@ class VGAEAttacker:
 
     def _build_graph(self, features):
         """基于余弦相似度构建局部图"""
-        # [修复] 添加 eps 防止除零错误 (Division by Zero)
+        # [稳定性修复] 增加 eps 防止除零
         features_norm = F.normalize(features, p=2, dim=1, eps=1e-8)
         sim_matrix = torch.mm(features_norm, features_norm.t())
 
@@ -115,11 +111,10 @@ class VGAEAttacker:
         adj.fill_diagonal_(0)
         self.adj_label = adj
 
-        # GCN 归一化: D^-1/2 * (A+I) * D^-1/2
+        # GCN 归一化
         adj_tilde = adj + torch.eye(adj.shape[0]).to(self.device)
         degree = torch.sum(adj_tilde, dim=1)
-
-        # [修复] 防止度为 0 (孤立点) 导致的除零
+        # [稳定性修复] 防止除零
         d_inv_sqrt = torch.pow(degree + 1e-8, -0.5)
         d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
         d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
@@ -135,34 +130,33 @@ class VGAEAttacker:
         for epoch in range(self.conf['vgae_epochs']):
             self.optimizer.zero_grad()
 
-            # [修复] 检查输入是否含有 NaN，如果有则跳过训练
+            # [稳定性修复] 检查输入 NaN
             if torch.isnan(self.f_polluted).any():
-                print("警告: 检测到 NaN 输入，跳过 VGAE 训练")
+                print(f"Warning: NaN detected in f_polluted at round {round_idx}, skipping training.")
                 return
 
             z, mu, logvar = self.vgae(self.f_polluted.detach(), self.adj_norm.detach())
             rec_adj, _ = inner_product_decoder(z)
 
-            # [修复关键点] 限制 BCE 输入范围
-            # 将输入限制在 [1e-7, 1 - 1e-7] 之间，彻底避免 log(0) 或 log(1)
+            # [关键修复] 限制 BCE 输入范围，防止 log(0)
             rec_adj = torch.clamp(rec_adj, min=1e-7, max=1.0 - 1e-7)
 
             # 计算重构损失
             loss_rec = F.binary_cross_entropy(rec_adj, self.adj_label.detach())
 
             # 计算 KL 散度损失
+            # [稳定性修复] 限制 KL 值的计算
             loss_kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
 
             loss = loss_rec + loss_kl
 
             if torch.isnan(loss):
-                print("警告: VGAE Loss 为 NaN，跳过此步")
+                print(f"Warning: NaN loss in VGAE at round {round_idx}, skipping step.")
                 break
 
             loss.backward()
 
-            # [修复] 梯度裁剪 (Gradient Clipping)
-            # 防止梯度爆炸导致参数变成 NaN
+            # [稳定性修复] 梯度裁剪
             torch.nn.utils.clip_grad_norm_(self.vgae.parameters(), max_norm=1.0)
 
             self.optimizer.step()
@@ -208,6 +202,10 @@ class VGAEAttacker:
             loss_attack = -torch.mean(torch.matmul(w_mal, attack_direction.unsqueeze(1)))
 
             total_loss = loss_latent + lambda_reg * loss_attack
+
+            if torch.isnan(total_loss):
+                break
+
             total_loss.backward()
             input_optimizer.step()
 
@@ -215,6 +213,12 @@ class VGAEAttacker:
         for p in self.vgae.parameters(): p.requires_grad = True
 
         final_mal_vec = w_mal.detach().squeeze()
+
+        # [稳定性修复] 检查生成的恶意更新是否含 NaN
+        if torch.isnan(final_mal_vec).any():
+            print("Warning: Generated malicious update contains NaN, falling back to random.")
+            return self._generate_random_update(benign_update_template)
+
         return self._vec_to_dict(final_mal_vec, benign_update_template)
 
     def _generate_random_update(self, template):
