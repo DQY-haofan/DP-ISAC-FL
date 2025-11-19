@@ -1,6 +1,6 @@
 # 文件名: server.py
 # 作用: 中央服务器 (上帝视角)。负责协调训练、攻击、防御、信道模拟和参数聚合。
-# 版本: Final (包含 R-JORA 三层循环、基线切换、Mask传递修复)
+# 版本: Final (修复 Mask 索引越界 Bug)
 
 import torch
 import numpy as np
@@ -137,27 +137,43 @@ class Server:
         instability = 0.0
 
         if r_conf['enabled'] and r_conf.get('enable_secure_isac', False):
-            # 生成动态掩码 mask_t
+            # 生成动态掩码 mask_t (长度 = len(selected_clients))
             mask_t = self.isac_scheduler.update_schedule(client_ids, round_idx)
             instability = self.isac_scheduler.instability_metric
 
         # --- 3. 内层循环: 训练与攻击 ---
 
         # 分类客户端
-        benigns = [c for c in selected_clients if isinstance(c, BenignClient)]
-        malicious = [c for c in selected_clients if isinstance(c, MaliciousClient)]
+        benigns = []
+        malicious = []
+
+        # [FIX] 同时分离 mask，确保 mask 索引与 benign_updates 对齐
+        benign_mask = None
+
+        if mask_t is not None:
+            # mask_t 是 Tensor, 需要拆分
+            # selected_clients 里的顺序是固定的，mask_t 对应这个顺序
+            benign_indices = [i for i, c in enumerate(selected_clients) if isinstance(c, BenignClient)]
+            benigns = [selected_clients[i] for i in benign_indices]
+            malicious = [c for c in selected_clients if isinstance(c, MaliciousClient)]
+
+            # 只取 Benign Clients 对应的 mask
+            # 这样 attacker 拿到的 mask 长度就等于 benign_updates 的长度了
+            benign_mask = mask_t[benign_indices]
+        else:
+            benigns = [c for c in selected_clients if isinstance(c, BenignClient)]
+            malicious = [c for c in selected_clients if isinstance(c, MaliciousClient)]
 
         global_params = self.global_model.state_dict()
 
         # A. 良性训练 (Benign Training)
         benign_updates = []
         for c in benigns:
-            # Client 内部会使用 self.conf['dp_sigma_z'] (已被动态更新)
             benign_updates.append(c.local_train(global_params))
 
         # B. 攻击者观测 (Attacker Observation)
-        # [CRITICAL]: 必须将 mask_t 传递给攻击者，否则 Secure-ISAC 无效
-        self.attacker.observe_dp_updates(benign_updates, round_idx, external_mask=mask_t)
+        # [CRITICAL FIX]: 传递切分后的 benign_mask
+        self.attacker.observe_dp_updates(benign_updates, round_idx, external_mask=benign_mask)
 
         # 训练 VGAE (如果到了 T_vgae 周期)
         self.attacker.train_vgae_if_needed(round_idx)
@@ -168,25 +184,26 @@ class Server:
             malicious_updates.append(c.local_train(global_params))
 
         # D. 信道传输 (Channel Transmission)
+        # 注意：这里我们需要把 updates 重新拼回去或者直接合并，顺序不影响 FedAvg 但可能影响调试
         all_updates = benign_updates + malicious_updates
         # 经过 ISAC 信道叠加通信噪声
         received_updates = self.channel.forward(all_updates)
 
         # E. 聚合 (Aggregation)
-        # 准备标签用于 STGA 诊断 (STGA 聚合本身不使用这些标签)
-        client_types = ['benign' if isinstance(c, BenignClient) else 'malicious' for c in selected_clients]
+        # 准备标签用于 STGA 诊断
+        # 注意 received_updates 的顺序是先 Benign 后 Malicious (因为上面是 list +)
+        client_types = ['benign'] * len(benigns) + ['malicious'] * len(malicious)
 
         # 调用选定的聚合器
         if self.conf.get('aggregator') == 'STGA':
             avg_update = self.aggregator.aggregate(received_updates, client_types)
-            # 记录信任分数
             theta_b = self.aggregator.diagnostics['avg_trust_benign']
             theta_m = self.aggregator.diagnostics['avg_trust_malicious']
         else:
             avg_update = self.aggregator.aggregate(received_updates)
-            theta_b, theta_m = 0, 0  # 非 STGA 模式无信任分数
+            theta_b, theta_m = 0, 0
 
-        # F. 更新全局模型
+            # F. 更新全局模型
         if avg_update:
             current_params = self.global_model.state_dict()
             for k in current_params:
