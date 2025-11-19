@@ -1,5 +1,6 @@
 # 文件名: vgae_attacker.py
-# 作用: 攻击者核心逻辑 (修复 CUDA 错误和数值不稳定性)
+# 作用: 核心攻击逻辑。包含 VGAE 模型和基于梯度的恶意样本生成 (Input Optimization)。
+# 版本: Final (Fix NaN using Cosine Similarity)
 
 import torch
 import torch.nn as nn
@@ -9,8 +10,14 @@ import numpy as np
 import copy
 
 
-# --- GCN & VGAE 模型定义 ---
+# --- GCN & VGAE 层定义 ---
+
 class GraphConv(nn.Module):
+    """
+    简单的图卷积层 (GCN Layer)
+    公式: H' = ReLU( D^-1/2 A D^-1/2 X W )
+    """
+
     def __init__(self, in_features, out_features):
         super(GraphConv, self).__init__()
         self.linear = nn.Linear(in_features, out_features)
@@ -22,6 +29,10 @@ class GraphConv(nn.Module):
 
 
 class VGAE(nn.Module):
+    """
+    变分图自编码器
+    """
+
     def __init__(self, input_dim, hidden_dim, latent_dim):
         super(VGAE, self).__init__()
         self.gc1 = GraphConv(input_dim, hidden_dim)
@@ -34,7 +45,6 @@ class VGAE(nn.Module):
 
     def reparameterize(self, mu, logvar):
         if self.training:
-            # [稳定性修复] 限制 logvar，防止 exp() 爆炸
             logvar = torch.clamp(logvar, max=10.0)
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
@@ -49,10 +59,13 @@ class VGAE(nn.Module):
 
 def inner_product_decoder(z):
     adj_logits = torch.matmul(z, z.t())
-    return torch.sigmoid(adj_logits), adj_logits
+    probs = torch.sigmoid(adj_logits)
+    probs = torch.clamp(probs, min=1e-7, max=1.0 - 1e-7)
+    return probs, adj_logits
 
 
-# --- 攻击者主类 ---
+# --- 攻击者逻辑 ---
+
 class VGAEAttacker:
     def __init__(self, config, input_dim):
         self.conf = config['attack']
@@ -64,7 +77,7 @@ class VGAEAttacker:
 
         self.f_polluted = None
         self.adj_norm = None
-        self.adj_label = None  # 新增：保存原始邻接矩阵用于 loss 计算
+        self.adj_label = None
 
     def _flatten_updates(self, updates):
         flat_list = []
@@ -78,7 +91,6 @@ class VGAEAttacker:
         return torch.stack(flat_list)
 
     def observe_dp_updates(self, dp_updates, round_idx, external_mask=None):
-        """窃听阶段"""
         num_updates = len(dp_updates)
         if num_updates == 0: return
 
@@ -101,18 +113,15 @@ class VGAEAttacker:
         self._build_graph(self.f_polluted)
 
     def _build_graph(self, features):
-        """构图阶段"""
-        # [稳定性] 加 eps 防止除零
         features_norm = F.normalize(features, p=2, dim=1, eps=1e-8)
         sim_matrix = torch.mm(features_norm, features_norm.t())
 
         adj = (sim_matrix >= self.conf['tau_sim']).float()
         adj.fill_diagonal_(0)
-        self.adj_label = adj  # 保存 label
+        self.adj_label = adj
 
         adj_tilde = adj + torch.eye(adj.shape[0]).to(self.device)
         degree = torch.sum(adj_tilde, dim=1)
-        # [稳定性] 防止孤立点导致的除零
         d_inv_sqrt = torch.pow(degree + 1e-8, -0.5)
         d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
         d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
@@ -120,7 +129,6 @@ class VGAEAttacker:
         self.adj_norm = torch.mm(torch.mm(d_mat_inv_sqrt, adj_tilde), d_mat_inv_sqrt)
 
     def train_vgae_if_needed(self, round_idx):
-        """VGAE 训练循环"""
         if round_idx % self.conf['t_vgae'] != 0 or self.f_polluted is None:
             return
 
@@ -128,44 +136,30 @@ class VGAEAttacker:
         for epoch in range(self.conf['vgae_epochs']):
             self.optimizer.zero_grad()
 
-            # [稳定性] 检查输入是否正常
             if torch.isnan(self.f_polluted).any():
-                print(f"⚠️ [VGAE] 警告: 输入特征包含 NaN，跳过本轮训练 (Round {round_idx})")
+                print(f"⚠️ [VGAE] NaN Input, Skip Round {round_idx}")
                 return
 
             z, mu, logvar = self.vgae(self.f_polluted.detach(), self.adj_norm.detach())
             rec_adj, _ = inner_product_decoder(z)
 
-            # [关键修复] 将重构结果强制限制在 [1e-7, 1-1e-7] 之间
-            rec_adj = torch.clamp(rec_adj, min=1e-7, max=1.0 - 1e-7)
-
-            # 确保 adj_label 存在
-            if self.adj_label is None:
-                # 如果构图失败，adj_label 可能为空，需重新构建或跳过
-                print("警告: adj_label 为空，跳过训练")
-                return
-
             loss_rec = F.binary_cross_entropy(rec_adj, self.adj_label.detach())
-
-            # [稳定性] 限制 logvar 范围后再计算 KL
-            # 虽然 reparameterize 已经 clamp 了，但这里最好也保护一下
-            logvar_clamped = torch.clamp(logvar, max=10.0)
-            loss_kl = -0.5 * torch.mean(torch.sum(1 + logvar_clamped - mu.pow(2) - logvar_clamped.exp(), dim=1))
+            loss_kl = -0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
 
             loss = loss_rec + loss_kl
 
             if torch.isnan(loss):
-                print(f"⚠️ [VGAE] 警告: Loss 变成 NaN，停止训练 (Round {round_idx})")
+                print(f"⚠️ [VGAE] NaN Loss, Stop Training")
                 break
 
             loss.backward()
-
-            # [稳定性] 梯度裁剪
             torch.nn.utils.clip_grad_norm_(self.vgae.parameters(), max_norm=1.0)
             self.optimizer.step()
 
     def generate_malicious_update(self, benign_update_template):
-        """生成恶意更新"""
+        """
+        基于梯度的恶意样本生成 (Stable Cosine Version)
+        """
         if self.f_polluted is None:
             return self._generate_random_update(benign_update_template)
 
@@ -173,16 +167,23 @@ class VGAEAttacker:
         for p in self.vgae.parameters(): p.requires_grad = False
 
         with torch.no_grad():
+            # 计算良性潜在中心
             _, mu_benign, _ = self.vgae(self.f_polluted, self.adj_norm)
             z_target = torch.mean(mu_benign, dim=0, keepdim=True)
             mean_benign_vec = torch.mean(self.f_polluted, dim=0)
 
+        # 确定攻击方向: 反向于良性更新的平均方向
         attack_direction = -torch.sign(mean_benign_vec).detach()
+        # 归一化攻击方向，确保计算 Cosine 时数值稳定
+        # attack_direction = F.normalize(attack_direction, p=2, dim=0)
+        # 上面这行不需要，因为 cosine_similarity 会自动处理归一化
 
+        # 初始化恶意输入 w_mal
         w_mal = mean_benign_vec.clone().detach().unsqueeze(0)
         w_mal.requires_grad_(True)
 
-        input_optimizer = optim.Adam([w_mal], lr=0.1)
+        # [优化] 降低学习率，防止震荡
+        input_optimizer = optim.Adam([w_mal], lr=0.01)
         lambda_reg = self.conf['lambda_attack']
 
         for i in range(30):
@@ -193,9 +194,18 @@ class VGAEAttacker:
             h1 = F.relu(self.vgae.gc1.linear(w_mal))
             z_mu_approx = self.vgae.gc_mu.linear(h1)
 
+            # Loss 1: 隐蔽性
             loss_latent = F.mse_loss(z_mu_approx, z_target)
-            loss_attack = -torch.mean(torch.matmul(w_mal, attack_direction.unsqueeze(1)))
 
+            # Loss 2: 破坏性 (改为余弦相似度!)
+            # 我们希望 w_mal 与 attack_direction 的相似度越大越好
+            # Cosine Sim 范围 [-1, 1].
+            # 我们最小化负的相似度 -> -1 (完全同向)
+            # 注意：unsqueeze 确保维度匹配 [1, d] vs [1, d]
+            cos_sim = F.cosine_similarity(w_mal, attack_direction.unsqueeze(0))
+            loss_attack = -cos_sim.mean()
+
+            # Total Loss
             total_loss = loss_latent + lambda_reg * loss_attack
 
             if torch.isnan(total_loss): break
@@ -208,7 +218,7 @@ class VGAEAttacker:
         final_mal_vec = w_mal.detach().squeeze()
 
         if torch.isnan(final_mal_vec).any():
-            print("⚠️ [Attack] 生成的恶意更新包含 NaN，回退到随机噪声。")
+            print("⚠️ [Attack] Generated NaN, fallback to random.")
             return self._generate_random_update(benign_update_template)
 
         return self._vec_to_dict(final_mal_vec, benign_update_template)
