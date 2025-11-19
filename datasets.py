@@ -1,5 +1,5 @@
 # 文件名: datasets.py
-# 作用: 数据集加载与 Non-IID 划分 (中文注释增强版)
+# 作用: 数据集加载与 Non-IID 划分 (修复除零错误)
 
 import torch
 import numpy as np
@@ -42,7 +42,6 @@ def partition_dataset_dirichlet(dataset, num_clients, alpha=0.3, seed=42):
     min_size = 0
     client_idcs = {}
 
-    # 安全计数器，防止死循环
     attempt = 0
     max_attempts = 100
 
@@ -58,14 +57,12 @@ def partition_dataset_dirichlet(dataset, num_clients, alpha=0.3, seed=42):
             idx_k = np.where(labels == k)[0]
             np.random.shuffle(idx_k)
 
-            # [修复] 如果该类样本太少，直接随机分配，不走 Dirichlet
             if len(idx_k) < num_clients:
                 subset_clients = np.random.choice(num_clients, len(idx_k), replace=False)
                 for i, client_idx in enumerate(subset_clients):
                     client_idcs[client_idx].append(idx_k[i])
                 continue
 
-            # 生成概率分布
             proportions = np.random.dirichlet(np.repeat(alpha, num_clients))
 
             # [关键修复] 防止除以零
@@ -75,10 +72,8 @@ def partition_dataset_dirichlet(dataset, num_clients, alpha=0.3, seed=42):
             else:
                 proportions = proportions / total_p
 
-            # 计算切分点 (防止越界)
             split_points = (np.cumsum(proportions) * len(idx_k)).astype(int)[:-1]
 
-            # 分割并分配
             idx_batch = np.split(idx_k, split_points)
             for i in range(num_clients):
                 client_idcs[i] += idx_batch[i].tolist()
