@@ -1,118 +1,61 @@
-import os
-
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"  # 强制同步报错
-
+import yaml
 import torch
 import numpy as np
-from vgae_attacker import VGAEAttacker
-from datasets import partition_dataset_dirichlet, get_dataset
-from server import Server
-import yaml
+from runner import SimulationRunner
 
 
-def test_data_partition():
-    print("\n[1/4] Testing Data Partitioning...")
-    try:
-        train_ds, _ = get_dataset('mnist', './data')
-        indices = partition_dataset_dirichlet(train_ds, 100, 0.3, 42)
+def diagnose():
+    print("=== 🏥 Training Health Check ===")
 
-        # Check indices
-        total_samples = sum([len(v) for v in indices.values()])
-        print(f"  - Total samples distributed: {total_samples}")
-        print(f"  - Min samples per client: {min([len(v) for v in indices.values()])}")
-        print(f"  - Max samples per client: {max([len(v) for v in indices.values()])}")
+    # 1. Check Ideal Scenario (No Attack)
+    print("\n[Test 1] Ideal Scenario (No Attack)")
+    runner = SimulationRunner('config.yaml')
+    conf_ideal = {
+        'scenario': 'Diag_Ideal',
+        'num_rounds': 5,  # Quick check
+        'aggregator': 'FedAvg',
+        'attack': {'malicious_fraction': 0.0}
+    }
+    acc_ideal = runner.run_single_seed(conf_ideal, 42, 'logs/diag_ideal.csv')
+    print(f"  -> Ideal Acc: {acc_ideal:.2f}%")
 
-        # Check boundaries
-        all_indices = np.concatenate(list(indices.values()))
-        print(f"  - Max index value: {all_indices.max()}")
-        print(f"  - Dataset length: {len(train_ds)}")
+    if acc_ideal < 20.0:
+        print("  ❌ ERROR: Benign training failed! Check LR or Model.")
+        return  # Stop here if benign training is broken
 
-        if all_indices.max() >= len(train_ds):
-            print("  ❌ ERROR: Index out of bounds in partition!")
-        else:
-            print("  ✅ Partition looks OK.")
-
-    except Exception as e:
-        print(f"  ❌ Crash in Data Partition: {e}")
-
-
-def test_attacker_graph_build():
-    print("\n[2/4] Testing VGAE Graph Building (CUDA)...")
-    try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"  - Using device: {device}")
-
-        # Mock config
-        config = {
-            'attack': {
-                'latent_dim': 16, 'vgae_lr': 0.01, 'q_eaves': 0.8,
-                'eaves_sigma': 0.01, 'tau_sim': 0.5, 't_vgae': 1, 'vgae_epochs': 1
-            }
+    # 2. Check Krum with Zero Attack (Lambda=0)
+    # 这一步是为了测试 Krum 在 Non-IID 下是否会误杀良性更新
+    print("\n[Test 2] Vulnerable (Krum + Zero Attack)")
+    conf_krum_zero = {
+        'scenario': 'Diag_Krum_Zero',
+        'num_rounds': 5,
+        'aggregator': 'Krum',
+        'attack': {
+            'malicious_fraction': 0.2,
+            'lambda_attack': 0.0  # No perturbation
         }
-        input_dim = 1000
-        attacker = VGAEAttacker(config, input_dim)
+    }
+    acc_krum = runner.run_single_seed(conf_krum_zero, 42, 'logs/diag_krum_zero.csv')
+    print(f"  -> Krum (Zero Attack) Acc: {acc_krum:.2f}%")
 
-        # Simulate updates
-        num_updates = 10
-        updates = []
-        for _ in range(num_updates):
-            updates.append({'w': torch.randn(input_dim).to(device)})
+    if acc_krum < acc_ideal - 20.0:
+        print("  ⚠️ Warning: Krum is hurting performance significantly even without attack.")
+        print("     (Common in Non-IID settings. Consider relaxing Non-IID alpha)")
 
-        print("  - Simulating observe_dp_updates...")
-        attacker.observe_dp_updates(updates, 0)
-
-        if attacker.f_polluted is not None:
-            print(f"  - f_polluted shape: {attacker.f_polluted.shape}")
-            print(f"  - adj_norm shape: {attacker.adj_norm.shape}")
-
-        print("  - Simulating training step...")
-        attacker.train_vgae_if_needed(0)
-
-        print("  ✅ VGAE operations OK.")
-
-    except Exception as e:
-        print(f"  ❌ Crash in VGAE: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-def test_generation():
-    print("\n[3/4] Testing Malicious Generation...")
-    try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        config = {
-            'attack': {
-                'latent_dim': 16, 'vgae_lr': 0.01, 'q_eaves': 0.8,
-                'eaves_sigma': 0.01, 'tau_sim': 0.5, 't_vgae': 1, 'vgae_epochs': 1,
-                'lambda_attack': 3.0
-            }
+    # 3. Check Weak Attack
+    print("\n[Test 3] Vulnerable (Krum + Weak Attack Lambda=0.1)")
+    conf_weak = {
+        'scenario': 'Diag_Weak',
+        'num_rounds': 5,
+        'aggregator': 'Krum',
+        'attack': {
+            'malicious_fraction': 0.2,
+            'lambda_attack': 0.1
         }
-        input_dim = 100
-        attacker = VGAEAttacker(config, input_dim)
-
-        # Mock state
-        attacker.f_polluted = torch.randn(8, input_dim).to(device)
-        attacker._build_graph(attacker.f_polluted)
-
-        template = {'w': torch.randn(input_dim).to(device)}
-
-        print("  - Generating update...")
-        mal = attacker.generate_malicious_update(template)
-
-        if torch.isnan(mal['w']).any():
-            print("  ❌ ERROR: Generated update contains NaN!")
-        else:
-            print("  ✅ Generation OK.")
-
-    except Exception as e:
-        print(f"  ❌ Crash in Generation: {e}")
-        import traceback
-        traceback.print_exc()
+    }
+    acc_weak = runner.run_single_seed(conf_weak, 42, 'logs/diag_weak.csv')
+    print(f"  -> Weak Attack Acc: {acc_weak:.2f}%")
 
 
 if __name__ == "__main__":
-    print("=== Starting Diagnostics ===")
-    test_data_partition()
-    test_attacker_graph_build()
-    test_generation()
-    print("\n=== Diagnostics Finished ===")
+    diagnose()
