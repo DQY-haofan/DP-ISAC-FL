@@ -51,8 +51,8 @@ r_jora:
   dp_search_min: 0.001
   dp_search_max: 10.0
   # 下面的常数建议先运行 calibration.py 获取
-  const_c_dp: 0.1
-  const_c_attack: 0.5
+  const_c_dp: 14.2149
+  const_c_attack: 142.1493
   t_middle: 1
   num_beams: 10
   visible_beams: 2
