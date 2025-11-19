@@ -18,7 +18,7 @@ lr: 0.005
 
 # Non-IID
 distribution: "dirichlet"
-alpha: 0.3
+alpha: 0.5
 
 # 初始 DP 参数 (会被 Optimal-DP 更新)
 clip_threshold: 15.0

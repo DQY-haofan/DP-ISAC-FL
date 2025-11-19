@@ -12,7 +12,7 @@ def diagnose():
     runner = SimulationRunner('config.yaml')
     conf_ideal = {
         'scenario': 'Diag_Ideal',
-        'num_rounds': 5,  # Quick check
+        'num_rounds': 20,  # Quick check
         'aggregator': 'FedAvg',
         'attack': {'malicious_fraction': 0.0}
     }
