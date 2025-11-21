@@ -237,14 +237,14 @@ def plot_fig6_tsne():
 
 def plot_fig7_heatmap_sorted(df):
     """
-        Fig 7: 动态对比度热力图
-        改进：使用 quantile 截断来增强对比度，防止极值导致中间颜色变灰。
+        Fig 7: 暴力拉伸对比度的热力图
+        策略: vmin/vmax 直接取数据的 min/max，不留余地。
         """
-    print("🎨 Plotting Fig 7: Heatmap (Enhanced Contrast)...")
+    print("🎨 Plotting Fig 7: Heatmap (Full Range Stretch)...")
     subset = df[df['Scenario'] == 'R-JORA'].copy()
     if subset.empty: return
 
-    # 构建矩阵
+    # 构建矩阵 (按类型排序: Malicious Top, Benign Bottom)
     heatmap_data = []
     rounds = sorted(subset['Round'].unique())
     max_clients = 0
@@ -263,26 +263,28 @@ def plot_fig7_heatmap_sorted(df):
 
     plt.figure(figsize=(5, 3.5))
 
-    # [Fix] 使用分位数作为颜色边界，增强视觉冲击力
-    # 5% 分位数为 vmin, 95% 分位数为 vmax
-    flat_data = matrix[~np.isnan(matrix)]
-    v_min = np.percentile(flat_data, 5)
-    v_max = np.percentile(flat_data, 95)
+    # [Fix] 绝对 Min-Max 归一化
+    # 即使差异只有 0.002，也要把这 0.002 映射到整个色谱
+    flat_valid = matrix[~np.isnan(matrix)]
+    v_min = np.min(flat_valid)
+    v_max = np.max(flat_valid)
 
-    ax = sns.heatmap(matrix, cmap='coolwarm', vmin=v_min, vmax=v_max,
+    # 使用 'jet' 或 'turbo' 这种彩虹色谱，对微小差异更敏感
+    # 或者 'RdYlBu_r' 保持学术风
+    ax = sns.heatmap(matrix, cmap='RdYlBu_r', vmin=v_min, vmax=v_max,
                      cbar_kws={'label': 'Trust Score'})
 
     plt.xlabel("Communication Rounds")
-    plt.ylabel("Participating Clients (Sorted)")
-    plt.title("(c) R-JORA Trust Dynamics (Quantile Scaled)")
+    plt.ylabel("Sampled Clients (Sorted)")
+    plt.title(f"(c) Trust Score Dynamics (Range: {v_min:.4f}-{v_max:.4f})")
 
     # 标注
-    plt.text(1, 2, 'Malicious (Suppressed)', color='blue', fontsize=9, weight='bold')
-    plt.text(1, max_clients - 3, 'Benign (Trusted)', color='red', fontsize=9, weight='bold')
+    plt.text(1, 1.5, 'Malicious', color='blue', fontsize=9, weight='bold')
+    plt.text(1, max_clients - 1.5, 'Benign', color='red', fontsize=9, weight='bold')
 
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Dynamic.pdf')
-    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Dynamic.png')
+    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Stretched.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Stretched.png')
     plt.close()
 
 def plot_fig8_mask():
@@ -306,35 +308,32 @@ def plot_fig8_mask():
 
 def plot_fig9_norm_density(df):
     """
-        Fig 9: Norm Density (Polished Violin)
+        Fig 9: 对数直方图
+        策略: 放弃 Violin，改用 Histogram 展示双峰分布。
         """
-    print("🎨 Plotting Fig 9: Norm Density (Refined)...")
+    print("🎨 Plotting Fig 9: Norm Histogram...")
     data = df[df['Round'] == 10].copy()
-    # 只看 FedAvg (原始数据分布)
-    subset = data[data['Scenario'] == 'FedAvg']
+    subset = data[data['Scenario'] == 'FedAvg']  # 原始分布
 
     plt.figure(figsize=(4, 3))
 
-    # cut=0 防止小提琴图延伸到数据范围之外
-    # bw_method 调整平滑度
-    sns.violinplot(
-        data=subset, x='Scenario', y='L2_Norm', hue='Type',
-        split=True,
-        inner='quartile',
+    sns.histplot(
+        data=subset, x='L2_Norm', hue='Type',
+        element="step",  # 阶梯状
+        stat="percent",  # Y轴百分比
+        common_norm=False,  # 各自归一化
+        log_scale=True,  # X轴对数坐标
         palette={'Benign': '#2ca02c', 'Malicious': '#d62728'},
-        cut=0,
-        bw_method=0.3  # 稍微锐利一点，不要太模糊
+        alpha=0.6
     )
 
-    plt.yscale('log')
-    plt.ylabel(r"Gradient $L_2$ Norm (Log Scale)")
-    plt.xlabel("Raw Update Distribution (No Defense)")
-    plt.title("(e) Norm Anomaly: The Physical Basis")
-    plt.legend(loc='upper right')
+    plt.xlabel(r"Gradient $L_2$ Norm (Log Scale)")
+    plt.ylabel("Percentage of Clients")
+    plt.title("(e) Norm Distribution Separation")
 
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Refined.pdf')
-    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Refined.png')
+    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Hist.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Hist.png')
     plt.close()
 
 def plot_fig10_radar():
@@ -372,9 +371,9 @@ def plot_fig10_radar():
 
 def plot_fig11_mechanism_comparison(df):
     """
-        Fig 11: 全景机理图 (保持不变，因为它效果很好)
+        Fig 11: 保持不变 (效果很好)
         """
-    print("🎨 Plotting Fig 11: Mechanism Comparison...")
+    print("🎨 Plotting Fig 11: Mechanism...")
     subset = df[df['Round'] == 10].copy()
     palette = {'Benign': '#2ca02c', 'Malicious': '#d62728'}
     markers = {'Benign': 'o', 'Malicious': 'X'}
@@ -385,8 +384,11 @@ def plot_fig11_mechanism_comparison(df):
 
     y_min = subset['L2_Norm'].min() * 0.8
     y_max = subset['L2_Norm'].max() * 1.5
-    benign_norms = subset[(subset['Scenario'] == 'R-JORA') & (subset['Type'] == 'Benign')]['L2_Norm']
-    threshold = benign_norms.median() * 1.5
+
+    # R-JORA 阈值
+    r_data = subset[subset['Scenario'] == 'R-JORA']
+    benign_norms = r_data[r_data['Type'] == 'Benign']['L2_Norm']
+    threshold = benign_norms.median() * 1.5 if not benign_norms.empty else 1.0
 
     for i, sc in enumerate(scenarios):
         ax = axes[i]
@@ -410,8 +412,10 @@ def plot_fig11_mechanism_comparison(df):
         if sc == 'R-JORA':
             ax.axhline(y=threshold, color='blue', linestyle='--', label='Clip Threshold')
 
-        # 标记 Krum 的选中点
         if sc == 'Krum':
+            # 选中点高亮
+            # Krum 良性权重可能是 0 或 0.2，恶意是 0 (本轮) 或 0.2 (如果选中)
+            # 这里的逻辑是：Weight > 0 即被选中
             selected = data[data['Weight'] > 1e-6]
             if not selected.empty:
                 ax.scatter(selected['Cosine_Sim'], selected['L2_Norm'], s=150, facecolors='none', edgecolors='black',
@@ -422,53 +426,47 @@ def plot_fig11_mechanism_comparison(df):
     plt.savefig(f'{OUTPUT_DIR}/Fig11_Mechanism_Full.png')
     plt.close()
 
-
 def plot_fig12_weight_distribution(df):
     """
-        Fig 12: 统计稳健的权重对比图
-        改进：
-        1. 聚合 Round 5 到 Round 25 的数据，消除单轮采样偏差。
-        2. 使用 Boxplot + Strip 组合，完美展示离散分布。
+        Fig 12: 纯 Strip Plot (散点)
+        策略: 放弃 Box/Violin，直接画点。
         """
-    print("🎨 Plotting Fig 12: Robust Weight Comparison...")
-
-    # [Fix] 聚合多轮数据，展示真实分布特征
-    data = df[df['Round'] > 5].copy()
+    print("🎨 Plotting Fig 12: Weight Scatter (Strip)...")
+    # 聚合 Round 10-25
+    data = df[df['Round'] >= 10].copy()
 
     plt.figure(figsize=(5, 3.5))
 
-    # 1. Boxplot: 展示统计区间
-    # fliersize=0 隐藏异常点，交给 strip 展示
-    sns.boxplot(
-        data=data, x='Scenario', y='Weight', hue='Type',
-        palette={'Benign': '#abdda4', 'Malicious': '#fdae61'},
-        linewidth=1.0, width=0.7, showfliers=False
-    )
-
-    # 2. Strip Plot: 展示数据点密度 (带透明度)
-    # alpha=0.05 非常淡，这样只有大量点重叠时才会显色
+    # Strip Plot: 抖动散点
     sns.stripplot(
         data=data, x='Scenario', y='Weight', hue='Type',
-        dodge=True, jitter=True, size=2,
-        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'},
-        alpha=0.15, ax=plt.gca()
+        dodge=True,  # 左右分开 Benign/Malicious
+        jitter=0.25,  # 增加抖动宽度，把重叠的点散开
+        size=3,  # 点的大小
+        alpha=0.6,  # 透明度
+        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'}
+    )
+
+    # 叠加均值线 (Pointplot) 只是为了指示中心
+    sns.pointplot(
+        data=data, x='Scenario', y='Weight', hue='Type',
+        dodge=0.4, join=False, markers="_", scale=1.2,
+        palette={'Benign': 'black', 'Malicious': 'black'},
+        errorbar=None
     )
 
     plt.xlabel(None)
-    plt.ylabel("Aggregation Weight")
-    plt.title("(d) Weight Assignment (Aggregated R5-R25)")
-    plt.ylim(-0.05, 1.05)
+    plt.ylabel("Assigned Weight")
+    plt.title("(d) Weight Distribution (Scatter View)")
 
-    # 修正图例（去重）
+    # 修正图例
     handles, labels = plt.gca().get_legend_handles_labels()
-    # 取前两个 (Boxplot 的图例颜色比较正)
     plt.legend(handles[:2], labels[:2], loc='upper center', bbox_to_anchor=(0.5, 1.15), ncol=2, frameon=False)
 
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Robust.pdf')
-    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Robust.png')
+    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Strip.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Strip.png')
     plt.close()
-
 
 def plot_fig12_weights(df):
     """
