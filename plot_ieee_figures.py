@@ -236,13 +236,15 @@ def plot_fig6_tsne():
 
 
 def plot_fig7_heatmap_sorted(df):
-    print("🎨 Plotting Fig 7: Heatmap (Max Contrast)...")
-    # 选取 R-JORA 数据
+    """
+        Fig 7: 动态对比度热力图
+        改进：使用 quantile 截断来增强对比度，防止极值导致中间颜色变灰。
+        """
+    print("🎨 Plotting Fig 7: Heatmap (Enhanced Contrast)...")
     subset = df[df['Scenario'] == 'R-JORA'].copy()
     if subset.empty: return
 
-    # 构建矩阵 [Clients, Rounds]
-    # 逻辑：每一轮先放 Malicious，再放 Benign (Top-Down Sorting)
+    # 构建矩阵
     heatmap_data = []
     rounds = sorted(subset['Round'].unique())
     max_clients = 0
@@ -251,32 +253,28 @@ def plot_fig7_heatmap_sorted(df):
         r_data = subset[subset['Round'] == r]
         mal = r_data[r_data['Type'] == 'Malicious']['Weight'].values
         ben = r_data[r_data['Type'] == 'Benign']['Weight'].values
-        # 拼接
         col = np.concatenate([mal, ben])
         heatmap_data.append(col)
         max_clients = max(max_clients, len(col))
 
-    # Pad
     matrix = np.full((max_clients, len(rounds)), np.nan)
     for i, col in enumerate(heatmap_data):
         matrix[:len(col), i] = col
 
     plt.figure(figsize=(5, 3.5))
 
-    # [Fix] 动态范围计算
-    # 找出数据中的最大值和最小值，作为颜色映射的边界
-    # 使用 nanmax/nanmin 忽略填充的 NaN
-    v_max = np.nanmax(matrix)
-    v_min = np.nanmin(matrix)
+    # [Fix] 使用分位数作为颜色边界，增强视觉冲击力
+    # 5% 分位数为 vmin, 95% 分位数为 vmax
+    flat_data = matrix[~np.isnan(matrix)]
+    v_min = np.percentile(flat_data, 5)
+    v_max = np.percentile(flat_data, 95)
 
-    # 使用 'coolwarm' 或 'RdYlBu_r'。
-    # 关键：不设置 center=0，而是让它自然铺满整个 min-max 范围
     ax = sns.heatmap(matrix, cmap='coolwarm', vmin=v_min, vmax=v_max,
-                     cbar_kws={'label': 'Trust Score (Weight)'})
+                     cbar_kws={'label': 'Trust Score'})
 
     plt.xlabel("Communication Rounds")
     plt.ylabel("Participating Clients (Sorted)")
-    plt.title("(c) R-JORA Trust Dynamics (High Contrast)")
+    plt.title("(c) R-JORA Trust Dynamics (Quantile Scaled)")
 
     # 标注
     plt.text(1, 2, 'Malicious (Suppressed)', color='blue', fontsize=9, weight='bold')
@@ -427,69 +425,107 @@ def plot_fig11_mechanism_comparison(df):
 
 def plot_fig12_weight_distribution(df):
     """
-        Fig 12: Weight Distribution (Hybrid: Box + Strip)
-        解决了 Boxenplot 在离散数据下显示异常的问题。
+        Fig 12: 统计稳健的权重对比图
+        改进：
+        1. 聚合 Round 5 到 Round 25 的数据，消除单轮采样偏差。
+        2. 使用 Boxplot + Strip 组合，完美展示离散分布。
         """
-    print("🎨 Plotting Fig 12: Hybrid Weight Comparison...")
-    # 选取第 10 轮 (稳态)
-    data = df[df['Round'] == 10].copy()
+    print("🎨 Plotting Fig 12: Robust Weight Comparison...")
 
-    plt.figure(figsize=(6, 4))
+    # [Fix] 聚合多轮数据，展示真实分布特征
+    data = df[df['Round'] > 5].copy()
 
-    # 1. Boxplot (箱线图): 展示统计分布
-    # showfliers=False 隐藏异常值点，因为我们后面会用 Strip 画出所有点
-    ax = sns.boxplot(
+    plt.figure(figsize=(5, 3.5))
+
+    # 1. Boxplot: 展示统计区间
+    # fliersize=0 隐藏异常点，交给 strip 展示
+    sns.boxplot(
         data=data, x='Scenario', y='Weight', hue='Type',
-        palette={'Benign': '#abdda4', 'Malicious': '#fdae61'},  # 浅色背景
-        showfliers=False,
-        linewidth=1.0,
-        width=0.6
+        palette={'Benign': '#abdda4', 'Malicious': '#fdae61'},
+        linewidth=1.0, width=0.7, showfliers=False
     )
 
-    # 2. Strip Plot (抖动散点图): 展示真实数据点密度
-    # dodge=True 确保点也按照 hue 分组偏移
+    # 2. Strip Plot: 展示数据点密度 (带透明度)
+    # alpha=0.05 非常淡，这样只有大量点重叠时才会显色
     sns.stripplot(
         data=data, x='Scenario', y='Weight', hue='Type',
-        dodge=True,
-        jitter=True,  # 关键：加入抖动，防止点重叠成一条线
-        size=3,
-        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'},  # 深色点
-        alpha=0.6,
-        ax=ax,
-        legend=False  # 不重复显示图例
+        dodge=True, jitter=True, size=2,
+        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'},
+        alpha=0.15, ax=plt.gca()
     )
 
     plt.xlabel(None)
-    plt.ylabel("Aggregation Weight (Assigned)")
-    plt.title("(d) Weight Assignment: Discrete vs Continuous")
+    plt.ylabel("Aggregation Weight")
+    plt.title("(d) Weight Assignment (Aggregated R5-R25)")
+    plt.ylim(-0.05, 1.05)
 
-    # 调整图例：只显示 Boxplot 的图例
-    handles, labels = ax.get_legend_handles_labels()
+    # 修正图例（去重）
+    handles, labels = plt.gca().get_legend_handles_labels()
+    # 取前两个 (Boxplot 的图例颜色比较正)
     plt.legend(handles[:2], labels[:2], loc='upper center', bbox_to_anchor=(0.5, 1.15), ncol=2, frameon=False)
 
-    # 添加辅助线
-    plt.grid(axis='y', alpha=0.3)
-
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Hybrid.pdf')
-    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Hybrid.png')
+    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Robust.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Robust.png')
     plt.close()
 
+
 def plot_fig12_weights(df):
-    print("🎨 Plotting Fig 12: Weight Comparison...")
-    if df is None: return
-    # 取第 15 轮
-    sub = df[df['Round'] == 15].copy()
+    """
+        Fig 11: 全景对比 (保持不变，效果很好)
+        """
+    print("🎨 Plotting Fig 11: Mechanism Comparison...")
+    # 仍然使用单轮快照，因为散点图太多点会乱
+    subset = df[df['Round'] == 10].copy()
 
-    plt.figure(figsize=(5, 3.5))
-    sns.violinplot(data=sub, x='Scenario', y='Weight', hue='Type', split=True,
-                   palette={'Benign': 'tab:green', 'Malicious': 'tab:red'},
-                   inner='quartile', gap=0.1)
+    palette = {'Benign': '#2ca02c', 'Malicious': '#d62728'}
+    markers = {'Benign': 'o', 'Malicious': 'X'}
 
-    plt.title("Fig. 12. Weight Assignment Comparison")
-    plt.ylim(-0.1, 1.1)
-    save_fig('Fig12_Weights')
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3.5), sharey=True)
+    scenarios = ['FedAvg', 'Krum', 'R-JORA']
+    titles = ['(a) FedAvg', '(b) Krum (Defense Backfire)', '(c) R-JORA (Effective)']
 
+    y_min = subset['L2_Norm'].min() * 0.8
+    y_max = subset['L2_Norm'].max() * 1.5
+
+    # R-JORA 阈值
+    r_data = subset[subset['Scenario'] == 'R-JORA']
+    benign_norms = r_data[r_data['Type'] == 'Benign']['L2_Norm']
+    threshold = benign_norms.median() * 1.5 if not benign_norms.empty else 1.0
+
+    for i, sc in enumerate(scenarios):
+        ax = axes[i]
+        data = subset[subset['Scenario'] == sc]
+        if data.empty: continue
+
+        sns.scatterplot(
+            data=data, x='Cosine_Sim', y='L2_Norm',
+            hue='Type', style='Type',
+            palette=palette, markers=markers,
+            s=80, alpha=0.7, edgecolor='k', linewidth=0.5,
+            ax=ax, legend=(i == 2)
+        )
+
+        ax.set_yscale('log')
+        ax.set_ylim(y_min, y_max)
+        ax.set_title(titles[i])
+        ax.set_xlabel("Cosine Similarity")
+        if i == 0: ax.set_ylabel(r"L2 Norm (Log)")
+
+        if sc == 'R-JORA':
+            ax.axhline(y=threshold, color='blue', linestyle='--', label='Clip Threshold')
+
+        # Krum Highlight
+        if sc == 'Krum':
+            selected = data[data['Weight'] > 1e-6]
+            if not selected.empty:
+                ax.scatter(selected['Cosine_Sim'], selected['L2_Norm'], s=150, facecolors='none', edgecolors='black',
+                           linewidth=1.5)
+
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}/Fig11_Mechanism_Full.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig11_Mechanism_Full.png')
+    plt.close()
 
 # ==========================================
 # 4. 主执行函数
