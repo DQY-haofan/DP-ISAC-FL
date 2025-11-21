@@ -260,7 +260,13 @@ class VGAEAttacker:
         # 解冻
         for p in self.vgae.parameters(): p.requires_grad = True
 
-        final_mal_vec = w_mal.detach().squeeze()
+        # [Critical Fix] 强制放大攻击幅度！
+        # FedAvg 需要足够大的恶意向量才能被破坏，否则会被良性更新稀释。
+        scale_factor = self.conf['lambda_attack']
+        # 如果是 Krum，可能需要较小的 scale 以保持隐蔽；如果是 FedAvg，需要大 scale。
+        # 这里我们直接应用 scale。
+        final_mal_vec = w_mal.detach().squeeze() * scale_factor
+
         if torch.isnan(final_mal_vec).any():
             return self._generate_random_update(benign_update_template)
 
