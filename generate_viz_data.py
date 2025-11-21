@@ -1,8 +1,8 @@
 # ============================================================
-# 脚本名: generate_viz_data_clean.py (v5.0 Final & Clean)
-# 修复: 1. KeyError 'latent_dim' (通过 .update 保留配置)
-#       2. 移除手动放大 Hack (还原真实攻击效果)
-# 作用: 采集真实、准确的高维数据用于画图
+# 脚本名: generate_viz_data_pro.py (v6.0 Multi-Scenario)
+# 作用: 1. 对比采集 (Vulnerable vs R-JORA)
+#       2. 进度条显示
+#       3. 导出全维度 CSV (viz_metrics_all.csv)
 # ============================================================
 import torch
 import numpy as np
@@ -10,164 +10,227 @@ import os
 import yaml
 import pandas as pd
 import shutil
+from tqdm import tqdm
 import torch.nn.functional as F
 from server import Server
 from stga import STGAAggregator
 from datasets import partition_dataset_dirichlet, get_dataset
 
 
-# --- 数据探针 (只负责记录，不修改数据) ---
-class UniversalProbe(STGAAggregator):
-    def __init__(self, config):
+# --- 通用探针 (Compatible with FedAvg & STGA) ---
+class DataProbe:
+    """独立于聚合器的探针类，用于捕获特征"""
+
+    def __init__(self, device):
+        self.device = device
+        self.metrics = {}
+
+    def capture(self, updates, aggregator_type='FedAvg'):
+        if not updates: return
+
+        # 1. 展平 & 转移到 GPU
+        flat_updates = []
+        for u in updates:
+            vec = torch.cat([v.view(-1) for k, v in sorted(u.items()) if v.dtype == torch.float32])
+            flat_updates.append(vec)
+        update_matrix = torch.stack(flat_updates).to(self.device)
+
+        # 2. 基础特征 (Norms, Cosines)
+        norms = torch.norm(update_matrix, p=2, dim=1)
+        center = torch.median(update_matrix, dim=0).values
+        cosines = F.cosine_similarity(update_matrix, center.unsqueeze(0), dim=1)
+
+        # 3. 权重 (根据聚合器类型推断)
+        if aggregator_type == 'STGA':
+            # 复现 STGA 权重计算逻辑
+            median_norm = torch.median(norms)
+            thresh = median_norm * 1.5
+            clip = torch.clamp(thresh / (norms + 1e-6), max=1.0)
+            # ... (简化：仅为了获取权重分布，假设 STGA 逻辑一致)
+            # 这里为了精准，建议直接从外部传入实际使用的 aggregator 实例读取
+            # 但为了通用性，我们这里只记录特征，权重留给 server 记录
+            pass
+
+        return {
+            'norms': norms.detach().cpu().numpy(),
+            'cosines': cosines.detach().cpu().numpy(),
+            'updates_sample': update_matrix[0].detach().cpu().numpy()  # 仅存一个样本用于debug
+        }
+
+
+# --- 增强版 Server ---
+class InstrumentedServer(Server):
+    def __init__(self, config, ds, idx):
+        super().__init__(config, ds, idx)
+        self.probe = DataProbe(self.device)
+
+    def run_round(self, round_idx):
+        # 1. 获取 Updates (复用父类逻辑前半部分)
+        #    为了不破坏父类结构，我们只能拦截 channel.forward 之后的结果
+        #    或者 Monkey Patching。这里选择覆盖 run_round 方法。
+
+        # ... (标准 Server 逻辑复刻) ...
+        # 为了最大兼容性，我们直接调用 super().run_round()
+        # 但我们需要在聚合前“偷看”数据。
+        # 方案：修改 self.aggregator.aggregate 方法
+        return super().run_round(round_idx)
+
+
+# --- 注入式聚合器 (最稳妥的方案) ---
+class ProbingAggregator(STGAAggregator):
+    def __init__(self, config, mode='STGA'):
         super().__init__(config)
-        self.round_data = {'norms': None, 'cosines': None, 'weights': None, 'updates': None}
+        self.mode = mode  # 'STGA' or 'FedAvg'
+        self.captured_data = None
 
     def aggregate(self, updates, client_types=None):
         if not updates: return None
 
-        # 1. 展平数据
-        flat_updates = [self._flatten(u) for u in updates]
-        update_matrix = torch.stack(flat_updates).to(self.device)
+        # --- [Capture] ---
+        flat = [self._flatten(u) for u in updates]
+        mat = torch.stack(flat).to(self.device)
 
-        # 2. [Capture] 捕获原始特征 (真实攻击效果)
-        raw_norms = torch.norm(update_matrix, p=2, dim=1)
-        raw_center = torch.median(update_matrix, dim=0).values
-        raw_cosines = F.cosine_similarity(update_matrix, raw_center.unsqueeze(0), dim=1)
+        norms = torch.norm(mat, p=2, dim=1)
+        raw_center = torch.median(mat, dim=0).values
+        cosines = F.cosine_similarity(mat, raw_center.unsqueeze(0), dim=1)
 
-        # 存入缓存
-        self.round_data['norms'] = raw_norms.detach().cpu().numpy()
-        self.round_data['cosines'] = raw_cosines.detach().cpu().numpy()
-        self.round_data['updates'] = update_matrix.detach().cpu().numpy()
+        # 计算 STGA 权重 (即便是 FedAvg 模式，我们也算一下“如果用 STGA 会给多少分”，用于对比)
+        # ... (STGA 核心逻辑)
+        median_norm = torch.median(norms)
+        clip = torch.clamp((median_norm * 1.5) / (norms + 1e-6), max=1.0)
+        mat_clipped = mat * clip.unsqueeze(1)
 
-        # 3. STGA 正常逻辑 (计算权重)
-        # Clipping
-        median_norm = torch.median(raw_norms)
-        threshold = median_norm * 1.5
-        clip_factor = torch.clamp(threshold / (raw_norms + 1e-6), max=1.0)
-        update_matrix_clipped = update_matrix * clip_factor.unsqueeze(1)
+        spat_center = torch.median(mat_clipped, dim=0).values
+        s_spat = (F.cosine_similarity(mat_clipped, spat_center.unsqueeze(0)) + 1) / 2 * 0.5 + \
+                 torch.exp(-torch.norm(mat_clipped - spat_center, p=2, dim=1) / (
+                             torch.median(torch.norm(mat_clipped - spat_center, p=2, dim=1)) + 1e-6)) * 0.5
 
-        # Spatial
-        spatial_center = torch.median(update_matrix_clipped, dim=0).values
-        s_spat_cos = F.cosine_similarity(update_matrix_clipped, spatial_center.unsqueeze(0), dim=1)
-        dists = torch.norm(update_matrix_clipped - spatial_center, p=2, dim=1)
-        sigma = torch.median(dists) + 1e-6
-        s_spat_dist = torch.exp(-dists / sigma)
-        s_spat = (s_spat_cos + 1) / 2 * 0.5 + s_spat_dist * 0.5
-
-        # Temporal
-        if len(self.history_updates) > 0:
-            expected_update = self.history_updates[-1].to(self.device)
-            s_temp = F.cosine_similarity(update_matrix_clipped, expected_update.unsqueeze(0), dim=1)
+        if self.history_updates:
+            s_temp = F.cosine_similarity(mat_clipped, self.history_updates[-1].to(self.device).unsqueeze(0))
         else:
             s_temp = torch.ones(len(updates)).to(self.device)
-        s_temp_norm = (s_temp + 1) / 2
 
-        # Weights
-        trust_scores = self.alpha * s_temp_norm + (1 - self.alpha) * s_spat
-        weights = F.softmax(trust_scores * 2.0, dim=0)
+        scores = self.conf['stga_alpha'] * (s_temp + 1) / 2 + (1 - self.conf['stga_alpha']) * s_spat
+        stga_weights = F.softmax(scores * 2.0, dim=0).detach().cpu().numpy()
 
-        self.round_data['weights'] = weights.detach().cpu().numpy()
+        # 真实使用的权重
+        if self.mode == 'FedAvg':
+            used_weights = np.ones(len(updates)) / len(updates)
+        else:
+            used_weights = stga_weights
 
-        # 调用父类 (不影响训练流)
-        return super().aggregate(updates, client_types)
+        self.captured_data = {
+            'norms': norms.detach().cpu().numpy(),
+            'cosines': cosines.detach().cpu().numpy(),
+            'stga_weights': stga_weights,  # 即使在 FedAvg 模式下也记录这个，用于展示“STGA 本该能防住”
+            'used_weights': used_weights,
+            'updates': mat.detach().cpu().numpy() if self.mode == 'STGA' else None  # 只存一次以免爆内存
+        }
+
+        # --- [Execute] ---
+        if self.mode == 'STGA':
+            return super().aggregate(updates, client_types)
+        else:
+            return self._fedavg(updates)
 
 
-# --- 主程序 ---
-def run_universal_harvest():
-    print("🚀 Starting Authentic Data Harvest (20 Rounds)...")
+# --- 主流程 ---
+def run_pro_harvest():
+    print("🎬 Starting Multi-Scenario Data Harvest...")
 
+    # 1. 准备
     if os.path.exists('viz_data'): shutil.rmtree('viz_data')
     os.makedirs('viz_data', exist_ok=True)
 
-    # 1. 正确加载配置 (Fix KeyError)
     with open('config.yaml') as f:
-        conf = yaml.safe_load(f)
+        base_conf = yaml.safe_load(f)
 
-    # 确保 R-JORA 开启
-    if 'r_jora' not in conf: conf['r_jora'] = {}
-    conf['r_jora'].update({'enabled': True, 'enable_stga': True, 'enable_optimal_dp': True, 'enable_secure_isac': True})
-    # 兜底 alpha
-    if 'stga_alpha' not in conf['r_jora']: conf['r_jora']['stga_alpha'] = 0.5
+    # 统一参数 (对齐 Run All)
+    ATTACK_PARAMS = {'malicious_fraction': 0.2, 'lambda_attack': 5.0}  # 强攻击
+    ROUNDS = 25
 
-    conf['num_rounds'] = 20
-    conf['scenario'] = 'Viz_Harvest'
-    conf['aggregator'] = 'STGA'
+    # 定义要跑的场景
+    scenarios = [
+        {'name': 'Vulnerable', 'aggregator': 'FedAvg', 'r_jora': False},
+        {'name': 'R-JORA', 'aggregator': 'STGA', 'r_jora': True}
+    ]
 
-    # [Fix] 使用 .update() 而不是覆盖，保留 latent_dim 等默认参数
-    # Lambda=5.0 对应你 run_all 里的高强度攻击
-    if 'attack' not in conf: conf['attack'] = {}
-    conf['attack'].update({'malicious_fraction': 0.2, 'lambda_attack': 5.0})
+    global_records = []
 
-    if torch.cuda.is_available(): conf['device'] = 'cuda'
+    # 2. 循环场景
+    for scen in scenarios:
+        print(f"\n📦 Harvesting Scenario: {scen['name']}...")
 
-    # 2. 初始化环境
-    print("   Loading data...")
-    ds, _ = get_dataset(conf['dataset'], conf['data_root'])
-    idx = partition_dataset_dirichlet(ds, conf['num_clients'], conf['alpha'], seed=42)
-    server = Server(conf, ds, idx)
+        # 配置克隆与修改
+        conf = base_conf.copy()
+        if 'attack' not in conf: conf['attack'] = {}
+        conf['attack'].update(ATTACK_PARAMS)
+        conf['num_rounds'] = ROUNDS
+        conf['scenario'] = scen['name']
 
-    # 注入探针
-    server.aggregator = UniversalProbe(conf)
+        if 'r_jora' not in conf: conf['r_jora'] = {}
+        conf['r_jora']['enabled'] = scen['r_jora']
+        if scen['r_jora']:
+            conf['r_jora'].update({'enable_stga': True, 'enable_optimal_dp': True, 'enable_secure_isac': True})
+            if 'stga_alpha' not in conf['r_jora']: conf['r_jora']['stga_alpha'] = 0.5
+        else:
+            # 即使是 Vulnerable，我们也开启 'enabled': False，但为了 Probe 能工作，
+            # 我们需要在 Server 初始化后手动注入 ProbingAggregator
+            pass
 
-    csv_records = []
+        if torch.cuda.is_available(): conf['device'] = 'cuda'
 
-    print(f"   Running with Lambda={conf['attack']['lambda_attack']} (Real Attack)")
+        # 初始化
+        ds, _ = get_dataset(conf['dataset'], conf['data_root'])
+        idx = partition_dataset_dirichlet(ds, conf['num_clients'], conf['alpha'], seed=42)
+        server = Server(conf, ds, idx)
 
-    for t in range(conf['num_rounds']):
-        # 运行一轮
-        server.run_round(t)
+        # 注入探针 (Mode = FedAvg or STGA)
+        # 注意：这里传入 mode 让探针知道真实的聚合逻辑
+        server.aggregator = ProbingAggregator(conf, mode=scen['aggregator'])
 
-        # 提取数据
-        data = server.aggregator.round_data
-        if data['weights'] is None: continue
+        # 进度条
+        pbar = tqdm(range(ROUNDS), desc=f"   {scen['name']}", unit="rnd")
 
-        # 推断类型 (假设 server.py 逻辑: benign在前, malicious在后)
-        num_mal = int(len(data['weights']) * conf['attack']['malicious_fraction'])
-        num_ben = len(data['weights']) - num_mal
-        current_types = ['Benign'] * num_ben + ['Malicious'] * num_mal
+        for t in pbar:
+            server.run_round(t)
 
-        # 保存 NPY (覆盖式保存，用于绘图脚本)
-        np.save(f'viz_data/weights_r{t}.npy', data['weights'])
-        np.save(f'viz_data/norms_r{t}.npy', data['norms'])
-        np.save(f'viz_data/cosines_r{t}.npy', data['cosines'])
-        np.save(f'viz_data/client_types_r{t}.npy', np.array(current_types))
+            data = server.aggregator.captured_data
+            if data is None: continue
 
-        # 记录到 CSV
-        for i in range(len(data['weights'])):
-            csv_records.append({
-                'Round': t, 'Type': current_types[i],
-                'L2_Norm': data['norms'][i],
-                'Cosine_Sim': data['cosines'][i],
-                'Weight': data['weights'][i]
-            })
+            # 推断类型
+            num_mal = int(len(data['norms']) * conf['attack']['malicious_fraction'])
+            num_ben = len(data['norms']) - num_mal
+            types = ['Benign'] * num_ben + ['Malicious'] * num_mal
 
-        # 关键帧保存 Update 向量
-        if t in [0, 5, 10, 19]:
-            np.save(f'viz_data/updates_r{t}.npy', data['updates'])
-            np.save(f'viz_data/client_types_tsne_r{t}.npy', np.array(current_types))
+            # 记录到列表
+            for i in range(len(data['norms'])):
+                global_records.append({
+                    'Scenario': scen['name'],
+                    'Round': t,
+                    'Client_ID': i,  # 这里的 ID 是 batch 内的相对 ID
+                    'Type': types[i],
+                    'L2_Norm': data['norms'][i],
+                    'Cosine_Sim': data['cosines'][i],
+                    'Weight_Used': data['used_weights'][i],
+                    'Weight_STGA_Score': data['stga_weights'][i]  # 这是一个虚拟分，用于对比
+                })
 
-        # 保存掩码
-        if hasattr(server.isac_scheduler, 'last_mask') and server.isac_scheduler.last_mask is not None:
-            np.save(f'viz_data/mask_r{t}.npy', server.isac_scheduler.last_mask.cpu().numpy())
+            # 保存 NPY (只保存 R-JORA 的关键帧用于 t-SNE)
+            if scen['name'] == 'R-JORA' and t in [0, 5, 10, 20]:
+                np.save(f'viz_data/updates_r{t}.npy', data['updates'])
+                np.save(f'viz_data/client_types_r{t}.npy', np.array(types))
 
-    # 导出 CSV
-    df = pd.DataFrame(csv_records)
-    df.to_csv('viz_metrics.csv', index=False)
+    # 3. 导出 CSV
+    df = pd.DataFrame(global_records)
+    df.to_csv('viz_metrics_pro.csv', index=False)
+    print(f"\n✅ Saved 'viz_metrics_pro.csv' ({len(df)} rows).")
 
-    # 验证数据合理性
-    mal_mean = df[df['Type'] == 'Malicious']['L2_Norm'].mean()
-    ben_mean = df[df['Type'] == 'Benign']['L2_Norm'].mean()
-    print(f"✅ Validation: Malicious Norm ({mal_mean:.1f}) vs Benign Norm ({ben_mean:.1f})")
-    if mal_mean > ben_mean * 2:
-        print("   -> 攻击特征显著，Fig 11 将会非常漂亮。")
-    else:
-        print("   -> 警告：攻击特征不明显，请检查 lambda_attack 是否生效。")
-
-    # 兼容性文件
-    all_types = np.array(
-        ['Malicious' if i < conf['num_clients'] * 0.2 else 'Benign' for i in range(conf['num_clients'])])
-    np.save('viz_data/client_types.npy', all_types)
+    # 简单的统计验证
+    print("\n--- Quick Validation (Mean L2 Norm) ---")
+    summary = df.groupby(['Scenario', 'Type'])['L2_Norm'].mean()
+    print(summary)
 
 
 if __name__ == "__main__":
-    run_universal_harvest()
+    run_pro_harvest()
