@@ -31,7 +31,7 @@ isac_sigma_ch: 0.005
 attack:
   malicious_fraction: 0.2
   # 下面的 lambda 建议先运行 tune_attacker.py 获取甜点值
-  lambda_attack: 1.0
+  lambda_attack: 5.0
   tau_sim: 0.5
   t_vgae: 10
   q_eaves: 0.8
