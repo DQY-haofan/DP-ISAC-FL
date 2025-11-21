@@ -236,55 +236,56 @@ def plot_fig6_tsne():
 
 
 def plot_fig7_heatmap_sorted(df):
-    print("🎨 Plotting Fig 7: Trust Heatmap (Sorted by Type)...")
+    print("🎨 Plotting Fig 7: Heatmap (Max Contrast)...")
     # 选取 R-JORA 数据
     subset = df[df['Scenario'] == 'R-JORA'].copy()
     if subset.empty: return
 
-    # 我们需要构建一个矩阵: [Clients, Rounds]
-    # 由于每轮选中的 Client 不同且 ID 未记录，我们采用 "按类型排序" 的策略
-    # 每一轮：先放 Malicious 的权重，再放 Benign 的权重
-    # 这样图中上方永远是 Malicious，下方是 Benign，以此展示 R-JORA 的压制效果
-
+    # 构建矩阵 [Clients, Rounds]
+    # 逻辑：每一轮先放 Malicious，再放 Benign (Top-Down Sorting)
     heatmap_data = []
     rounds = sorted(subset['Round'].unique())
     max_clients = 0
 
     for r in rounds:
         r_data = subset[subset['Round'] == r]
-        # 分离并排序
         mal = r_data[r_data['Type'] == 'Malicious']['Weight'].values
         ben = r_data[r_data['Type'] == 'Benign']['Weight'].values
-        # 拼接：Malicious 在前 (Top in heatmap), Benign 在后
-        # 为了对齐，不足的部分补 NaN
+        # 拼接
         col = np.concatenate([mal, ben])
         heatmap_data.append(col)
         max_clients = max(max_clients, len(col))
 
-    # Pad 到最大长度
+    # Pad
     matrix = np.full((max_clients, len(rounds)), np.nan)
     for i, col in enumerate(heatmap_data):
         matrix[:len(col), i] = col
 
     plt.figure(figsize=(5, 3.5))
-    # 使用 RdYlBu_r: 红色(高权重) -> 蓝色(低权重)
-    # 我们希望 Malicious (Top rows) 是蓝色的 (被压制)
-    ax = sns.heatmap(matrix, cmap='RdYlBu_r', vmin=0, vmax=0.15,
-                     cbar_kws={'label': 'Trust Score'})
+
+    # [Fix] 动态范围计算
+    # 找出数据中的最大值和最小值，作为颜色映射的边界
+    # 使用 nanmax/nanmin 忽略填充的 NaN
+    v_max = np.nanmax(matrix)
+    v_min = np.nanmin(matrix)
+
+    # 使用 'coolwarm' 或 'RdYlBu_r'。
+    # 关键：不设置 center=0，而是让它自然铺满整个 min-max 范围
+    ax = sns.heatmap(matrix, cmap='coolwarm', vmin=v_min, vmax=v_max,
+                     cbar_kws={'label': 'Trust Score (Weight)'})
 
     plt.xlabel("Communication Rounds")
-    plt.ylabel("Sampled Clients (Sorted by Type)")
-    plt.title("(c) Trust Score Evolution (Top: Malicious, Bottom: Benign)")
+    plt.ylabel("Participating Clients (Sorted)")
+    plt.title("(c) R-JORA Trust Dynamics (High Contrast)")
 
-    # 添加文字标注
-    plt.text(1, 1, 'Malicious Area', color='blue', fontsize=9, weight='bold')
-    plt.text(1, max_clients - 2, 'Benign Area', color='red', fontsize=9, weight='bold')
+    # 标注
+    plt.text(1, 2, 'Malicious (Suppressed)', color='blue', fontsize=9, weight='bold')
+    plt.text(1, max_clients - 3, 'Benign (Trusted)', color='red', fontsize=9, weight='bold')
 
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Sorted.png')
-    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Sorted.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Dynamic.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig7_Heatmap_Dynamic.png')
     plt.close()
-
 
 def plot_fig8_mask():
     print("🎨 Plotting Fig 8: Mask Diff...")
@@ -306,34 +307,37 @@ def plot_fig8_mask():
 
 
 def plot_fig9_norm_density(df):
-    print("🎨 Plotting Fig 9: Norm Density (Split Violin)...")
-    # 使用 Violin 展示 Norm 的分布差异，而不是 Weight
-    # 这能更好地说明为什么 R-JORA 需要 Norm Clipping
+    """
+        Fig 9: Norm Density (Polished Violin)
+        """
+    print("🎨 Plotting Fig 9: Norm Density (Refined)...")
     data = df[df['Round'] == 10].copy()
+    # 只看 FedAvg (原始数据分布)
+    subset = data[data['Scenario'] == 'FedAvg']
 
     plt.figure(figsize=(4, 3))
 
-    # 只看 Vulnerable (FedAvg) 场景下的原始 Norm 分布
-    # 因为不同算法下 Update 还是那批 Update (除了 Clipping 后)
-    # 但 CSV 里记录的是聚合器看到的。FedAvg 看到的是原始的。
-    subset = data[data['Scenario'] == 'FedAvg']
-
+    # cut=0 防止小提琴图延伸到数据范围之外
+    # bw_method 调整平滑度
     sns.violinplot(
         data=subset, x='Scenario', y='L2_Norm', hue='Type',
-        split=True, inner='quartile',
-        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'}
+        split=True,
+        inner='quartile',
+        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'},
+        cut=0,
+        bw_method=0.3  # 稍微锐利一点，不要太模糊
     )
 
     plt.yscale('log')
-    plt.ylabel(r"Gradient $L_2$ Norm")
-    plt.xlabel("Raw Updates Distribution")
-    plt.title("(e) Norm Anomaly Analysis")
+    plt.ylabel(r"Gradient $L_2$ Norm (Log Scale)")
+    plt.xlabel("Raw Update Distribution (No Defense)")
+    plt.title("(e) Norm Anomaly: The Physical Basis")
+    plt.legend(loc='upper right')
 
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Violin.png')
-    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Violin.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Refined.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig9_Norm_Refined.png')
     plt.close()
-
 
 def plot_fig10_radar():
     print("🎨 Plotting Fig 10: Radar...")
@@ -369,106 +373,106 @@ def plot_fig10_radar():
 
 
 def plot_fig11_mechanism_comparison(df):
-    print("🎨 Plotting Fig 11: Mechanism Comparison (1x3 Grid)...")
-    # 选取第 10 轮 (稳态)
+    """
+        Fig 11: 全景机理图 (保持不变，因为它效果很好)
+        """
+    print("🎨 Plotting Fig 11: Mechanism Comparison...")
     subset = df[df['Round'] == 10].copy()
-
-    # 定义颜色和标记
     palette = {'Benign': '#2ca02c', 'Malicious': '#d62728'}
     markers = {'Benign': 'o', 'Malicious': 'X'}
 
-    # 创建 1x3 子图
     fig, axes = plt.subplots(1, 3, figsize=(12, 3.5), sharey=True)
-
     scenarios = ['FedAvg', 'Krum', 'R-JORA']
-    titles = ['(a) FedAvg (No Defense)', '(b) Krum (Defense Backfire)', '(c) R-JORA (Effective)']
+    titles = ['(a) FedAvg', '(b) Krum (Failed)', '(c) R-JORA (Robust)']
 
-    # 获取统一的 Y 轴范围 (Log Scale)
     y_min = subset['L2_Norm'].min() * 0.8
     y_max = subset['L2_Norm'].max() * 1.5
-
-    # 获取 STGA 的阈值用于参考
     benign_norms = subset[(subset['Scenario'] == 'R-JORA') & (subset['Type'] == 'Benign')]['L2_Norm']
     threshold = benign_norms.median() * 1.5
 
     for i, sc in enumerate(scenarios):
         ax = axes[i]
         data = subset[subset['Scenario'] == sc]
-
         if data.empty: continue
 
-        # 绘制散点
         sns.scatterplot(
             data=data, x='Cosine_Sim', y='L2_Norm',
             hue='Type', style='Type',
             palette=palette, markers=markers,
             s=80, alpha=0.7, edgecolor='k', linewidth=0.5,
-            ax=ax, legend=(i == 2)  # 只在最后一张图显示图例
+            ax=ax, legend=(i == 2)
         )
 
         ax.set_yscale('log')
         ax.set_ylim(y_min, y_max)
-        ax.set_title(titles[i], fontsize=11)
+        ax.set_title(titles[i])
         ax.set_xlabel("Cosine Similarity")
-        if i == 0:
-            ax.set_ylabel(r"L2 Norm (Log Scale)")
+        if i == 0: ax.set_ylabel(r"L2 Norm (Log)")
 
-        # 在 R-JORA 图中画阈值线
         if sc == 'R-JORA':
-            ax.axhline(y=threshold, color='blue', linestyle='--', linewidth=1.5, label='Clip Threshold')
-            # 标注被裁剪区域
-            ax.text(0.1, y_max * 0.5, "Clipped Area", color='blue', fontsize=9, ha='left')
+            ax.axhline(y=threshold, color='blue', linestyle='--', label='Clip Threshold')
 
-        # 在 Krum 图中，圈出被选中的点 (如果能拿到权重)
+        # 标记 Krum 的选中点
         if sc == 'Krum':
-            # 简单的可视化：Krum 选中的是权重 > 0 的点
             selected = data[data['Weight'] > 1e-6]
-            # 画一个圈或者高亮
-            ax.scatter(selected['Cosine_Sim'], selected['L2_Norm'], s=150, facecolors='none', edgecolors='black',
-                       linewidth=1.5, label='Selected')
+            if not selected.empty:
+                ax.scatter(selected['Cosine_Sim'], selected['L2_Norm'], s=150, facecolors='none', edgecolors='black',
+                           linewidth=1.5)
 
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig11_Mechanism_Full.png')
     plt.savefig(f'{OUTPUT_DIR}/Fig11_Mechanism_Full.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig11_Mechanism_Full.png')
     plt.close()
 
 
 def plot_fig12_weight_distribution(df):
-    print("🎨 Plotting Fig 12: Weight Distribution (Boxen Plot)...")
-    # 选取第 10 轮
+    """
+        Fig 12: Weight Distribution (Hybrid: Box + Strip)
+        解决了 Boxenplot 在离散数据下显示异常的问题。
+        """
+    print("🎨 Plotting Fig 12: Hybrid Weight Comparison...")
+    # 选取第 10 轮 (稳态)
     data = df[df['Round'] == 10].copy()
 
-    plt.figure(figsize=(5, 3.5))
+    plt.figure(figsize=(6, 4))
 
-    # 使用 Boxenplot 代替 Violin，更适合展示偏态/离散分布
-    # 或者使用 stripplot 叠加
-
-    # 1. Boxenplot
-    ax = sns.boxenplot(
+    # 1. Boxplot (箱线图): 展示统计分布
+    # showfliers=False 隐藏异常值点，因为我们后面会用 Strip 画出所有点
+    ax = sns.boxplot(
         data=data, x='Scenario', y='Weight', hue='Type',
-        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'},
-        k_depth='trustworthy'
+        palette={'Benign': '#abdda4', 'Malicious': '#fdae61'},  # 浅色背景
+        showfliers=False,
+        linewidth=1.0,
+        width=0.6
     )
 
-    # 2. 叠加 Strip plot (抖动点)，展示真实数据点分布
+    # 2. Strip Plot (抖动散点图): 展示真实数据点密度
+    # dodge=True 确保点也按照 hue 分组偏移
     sns.stripplot(
         data=data, x='Scenario', y='Weight', hue='Type',
-        dodge=True, jitter=True, size=2, color='k', alpha=0.5, ax=ax, legend=False
+        dodge=True,
+        jitter=True,  # 关键：加入抖动，防止点重叠成一条线
+        size=3,
+        palette={'Benign': '#2ca02c', 'Malicious': '#d62728'},  # 深色点
+        alpha=0.6,
+        ax=ax,
+        legend=False  # 不重复显示图例
     )
 
     plt.xlabel(None)
-    plt.ylabel("Aggregation Weight")
-    plt.title("(d) Weight Assignment Distribution")
-    plt.ylim(-0.05, 1.05)
+    plt.ylabel("Aggregation Weight (Assigned)")
+    plt.title("(d) Weight Assignment: Discrete vs Continuous")
 
-    # 优化图例
+    # 调整图例：只显示 Boxplot 的图例
     handles, labels = ax.get_legend_handles_labels()
-    # 只保留前两个 (Benign, Malicious)
     plt.legend(handles[:2], labels[:2], loc='upper center', bbox_to_anchor=(0.5, 1.15), ncol=2, frameon=False)
 
+    # 添加辅助线
+    plt.grid(axis='y', alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Boxen.png')
-    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Boxen.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Hybrid.pdf')
+    plt.savefig(f'{OUTPUT_DIR}/Fig12_Weights_Hybrid.png')
     plt.close()
 
 def plot_fig12_weights(df):
