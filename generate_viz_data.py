@@ -1,6 +1,7 @@
 # ============================================================
 # 脚本名: generate_viz_data.py
 # 作用: 采集用于高级可视化(t-SNE, Heatmap)的高维数据
+# 版本: Fixed (Solved KeyError: 'stga_alpha')
 # ============================================================
 import torch
 import numpy as np
@@ -57,6 +58,7 @@ class InstrumentedSTGA(STGAAggregator):
         s_temp_norm = (s_temp + 1) / 2
 
         # 4. Weights
+        # [Fix] 确保 self.alpha 存在 (父类已初始化)
         trust_scores = self.alpha * s_temp_norm + (1 - self.alpha) * s_spat
         weights = F.softmax(trust_scores * 2.0, dim=0)
 
@@ -72,13 +74,28 @@ def run_harvest():
     print("🚜 Starting Visualization Data Harvest (20 Rounds)...")
     os.makedirs('viz_data', exist_ok=True)
 
-    # 读取配置并强制修改为 R-JORA 场景
+    # 读取配置
     with open('config.yaml') as f:
         conf = yaml.safe_load(f)
+
+    # [Critical Fix] 不要覆盖整个 r_jora 字典，而是更新它
+    # 这样可以保留 config.yaml 里的 stga_alpha
+    if 'r_jora' not in conf: conf['r_jora'] = {}
+    conf['r_jora'].update({
+        'enabled': True,
+        'enable_stga': True,
+        'enable_optimal_dp': True,
+        'enable_secure_isac': True
+    })
+
+    # 兜底：万一 config.yaml 里真的没有，赋默认值
+    if 'stga_alpha' not in conf['r_jora']:
+        conf['r_jora']['stga_alpha'] = 0.5
+
     conf['num_rounds'] = 20  # 只跑20轮
     conf['scenario'] = 'Viz_Harvest'
     conf['aggregator'] = 'STGA'
-    conf['r_jora'] = {'enabled': True, 'enable_stga': True, 'enable_optimal_dp': True, 'enable_secure_isac': True}
+
     # 使用较强的攻击来凸显防御效果
     conf['attack'] = {'malicious_fraction': 0.2, 'lambda_attack': 3.0, 'tau_sim': 0.5, 't_vgae': 1, 'q_eaves': 0.8,
                       'eaves_sigma': 0.005, 'vgae_epochs': 5, 'vgae_lr': 0.01, 'latent_dim': 16}
@@ -87,15 +104,15 @@ def run_harvest():
 
     # 初始化环境
     ds, _ = get_dataset(conf['dataset'], conf['data_root'])
-    # 固定种子以复现
     idx = partition_dataset_dirichlet(ds, conf['num_clients'], conf['alpha'], seed=42)
 
     server = Server(conf, ds, idx)
 
     # [注入] 替换聚合器为间谍聚合器
+    # 注意：必须重新传入完整的 conf
     server.aggregator = InstrumentedSTGA(conf)
 
-    # 记录客户端类型 (用于画图配色)
+    # 记录客户端类型
     client_types = np.array(
         ['Malicious' if i in server.malicious_ids else 'Benign' for i in range(conf['num_clients'])])
     np.save('viz_data/client_types.npy', client_types)
@@ -107,20 +124,6 @@ def run_harvest():
 
         # A. 保存权重 (Heatmap)
         if server.aggregator.captured_weights is not None:
-            # 注意：这里捕获的是本轮 *选中* 的客户端的权重。
-            # 为了画全员热力图，我们需要映射回 client_id
-            # 简化起见，我们假设 server.select_clients() 的逻辑在 harvest 模式下是固定的或者我们只记录选中的
-            # 更严谨的做法：记录本轮选中的 client IDs
-            pass  # 这里为了脚本简洁，暂略，直接保存 raw weights，绘图时处理
-
-            # 保存完整数据：(Client_IDs, Weights)
-            # 获取本轮选中的客户端 ID
-            selected_clients = server.select_clients()  # 注意：这里调用会重新随机，不能这样
-            # Hack: server.run_round 内部选了，我们没法直接拿。
-            # 补救：修改 Server 比较麻烦。我们直接用简单的假设：
-            # 在 visualization 模式下，我们可以让所有 weights 存下来。
-            # 实际上，INSTRUMENTED STGA 拿到的 updates 列表顺序对应了选中的客户端顺序。
-
             np.save(f'viz_data/weights_r{t}.npy', server.aggregator.captured_weights)
 
         # B. 保存更新向量 (t-SNE) - 仅保存关键轮次
