@@ -1,11 +1,12 @@
 # 文件名: runner.py
-# 作用: 实验执行引擎。封装了 Exp1-5 的具体逻辑。
-# 版本: Final (Hardware-aware)
+# 作用: 实验执行引擎。封装了 Exp1-5 的具体逻辑。(Added tqdm progress bar)
+# 版本: Final + tqdm
 
 import yaml
 import torch
 import numpy as np
 import copy
+from tqdm import tqdm  # <--- [New Import]
 from torch.utils.data import DataLoader
 from datasets import get_dataset, partition_dataset_dirichlet
 from server import Server
@@ -19,6 +20,8 @@ class SimulationRunner:
 
     def _prepare_data(self):
         if self.data_ready: return
+        # 这里也可以加一个简单的 print 提示数据加载
+        print("Loading datasets...")
         self.train_ds, self.test_ds = get_dataset(self.base_config['dataset'], self.base_config['data_root'])
         self.test_loader = DataLoader(self.test_ds, batch_size=1000, shuffle=False)
         self.data_ready = True
@@ -29,7 +32,7 @@ class SimulationRunner:
         self._recursive_update(config, config_override)
 
         if torch.cuda.is_available():
-            print("GPU detected! Using CUDA.")
+            # print("GPU detected! Using CUDA.") # tqdm 下减少 print 防止刷屏
             config['device'] = 'cuda'
         else:
             config['device'] = 'cpu'
@@ -44,16 +47,24 @@ class SimulationRunner:
         logger = ExperimentLogger(log_file)
         server = Server(config, self.train_ds, client_indices)
 
-        print(f"-> Running {config['scenario']} (Seed {seed})...")
+        # print(f"-> Running {config['scenario']} (Seed {seed})...") # 改用 tqdm 的 description 显示
+
+        # [New] 使用 tqdm 包装循环
+        # desc 显示当前正在跑哪个实验场景和种子
+        pbar = tqdm(range(config['num_rounds']), desc=f"Scen: {config['scenario']} (S{seed})", unit="round")
+
         acc = 0
-        for t in range(config['num_rounds']):
+        for t in pbar:
             stats = server.run_round(t)
             loss, acc = server.evaluate(self.test_loader)
             stats.update({'accuracy': acc, 'loss': loss})
             meta = {'scenario': config['scenario'], 'seed': seed, 'beta': config['attack']['malicious_fraction'],
                     'sigma_z': stats['dp_sigma']}
             logger.log_round(t, stats, meta)
-            if t % 10 == 0: print(f"   Round {t}: Acc={acc:.2f}%")
+
+            # [New] 实时在进度条右侧更新准确率，不需要原来每10轮的 print 了
+            pbar.set_postfix({'Acc': f"{acc:.2f}%", 'Loss': f"{loss:.4f}"})
+
         return acc
 
     def _recursive_update(self, d, u):
@@ -65,6 +76,7 @@ class SimulationRunner:
         return d
 
     def run_exp1_vulnerability(self, n_seeds=3):
+        print(f"\n=== Running Experiment 1 (Seeds={n_seeds}) ===")
         scenarios = {
             'Ideal': {'scenario': 'Ideal', 'aggregator': 'FedAvg', 'attack': {'malicious_fraction': 0.0}},
             'Vulnerable': {'scenario': 'Vulnerable', 'aggregator': 'FedAvg', 'attack': {'malicious_fraction': 0.2}}
@@ -73,6 +85,7 @@ class SimulationRunner:
             for s in range(n_seeds): self.run_single_seed(conf, 42 + s, f'logs/exp1/{name}_seed{s}.csv')
 
     def run_exp2_efficacy(self, n_seeds=3):
+        print(f"\n=== Running Experiment 2 (Seeds={n_seeds}) ===")
         scenarios = {
             'Ideal': {'scenario': 'Ideal', 'aggregator': 'FedAvg', 'attack': {'malicious_fraction': 0.0}},
             'Vulnerable': {'scenario': 'Vulnerable', 'aggregator': 'FedAvg', 'attack': {'malicious_fraction': 0.2}},
@@ -84,6 +97,7 @@ class SimulationRunner:
             for s in range(n_seeds): self.run_single_seed(conf, 42 + s, f'logs/exp2/{name}_seed{s}.csv')
 
     def run_exp3_baselines(self, n_seeds=3):
+        print(f"\n=== Running Experiment 3 (Seeds={n_seeds}) ===")
         betas = [0.1, 0.2, 0.3]
         modes = ['Vulnerable', 'Krum', 'Median', 'HighDP', 'R-JORA']
         for beta in betas:
@@ -105,6 +119,7 @@ class SimulationRunner:
                 for s in range(n_seeds): self.run_single_seed(conf, 42 + s, f'logs/exp3/{mode}_beta{beta}_seed{s}.csv')
 
     def run_exp4_pru_tradeoff(self):
+        print(f"\n=== Running Experiment 4 ===")
         sigmas = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
         modes = ['Vulnerable', 'R-JORA']
         for sigma in sigmas:
@@ -119,6 +134,7 @@ class SimulationRunner:
                 self.run_single_seed(conf, 42, f'logs/exp4/{mode}_sigma{sigma}.csv')
 
     def run_exp5_ablation(self, n_seeds=3):
+        print(f"\n=== Running Experiment 5 (Seeds={n_seeds}) ===")
         base = {'enabled': True, 'enable_stga': True, 'enable_optimal_dp': True, 'enable_secure_isac': True}
         configs = {'Full': base, 'No-STGA': {**base, 'enable_stga': False},
                    'No-OptDP': {**base, 'enable_optimal_dp': False}, 'No-ISAC': {**base, 'enable_secure_isac': False}}

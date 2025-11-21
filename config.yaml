@@ -13,7 +13,7 @@ num_clients: 100
 num_rounds: 50
 client_fraction: 0.1
 local_epochs: 5
-batch_size: 64
+batch_size: 512
 lr: 0.005
 
 # Non-IID
@@ -31,7 +31,7 @@ isac_sigma_ch: 0.005
 attack:
   malicious_fraction: 0.2
   # 下面的 lambda 建议先运行 tune_attacker.py 获取甜点值
-  lambda_attack: 3.0
+  lambda_attack: 1.0
   tau_sim: 0.5
   t_vgae: 10
   q_eaves: 0.8
