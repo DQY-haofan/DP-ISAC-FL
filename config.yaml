@@ -10,7 +10,7 @@ data_root: "./data"
 
 # 联邦学习
 num_clients: 100
-num_rounds: 50
+num_rounds: 30
 client_fraction: 0.1
 local_epochs: 5
 batch_size: 512
