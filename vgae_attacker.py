@@ -114,7 +114,7 @@ class VGAEAttacker:
             num_obs = int(num_updates * self.conf['q_eaves'])
             obs_indices = torch.randperm(num_updates)[:num_obs].to(self.device)
 
-        if len(obs_indices) == 0:
+        if len(obs_indices) < 2:
             self.f_polluted = None
             return
 
